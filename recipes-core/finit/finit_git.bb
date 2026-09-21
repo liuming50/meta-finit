@@ -23,21 +23,21 @@ WATCHDOG_DEVICE ?= "/dev/watchdog"
 
 PACKAGECONFIG_CONFARGS[vardepsexclude] = "RTC_RESTORE_DATE"
 PACKAGECONFIG ??= "auto-reload \
+                   dbus \
                    fastboot \
                    random-seed \
                    hook-scripts-plugin \
                    kernel-cmdline \
+                   keventd \
                    libcap \
-                   libsystemd \
                    modules-load-plugin \
-                   hotplug-plugin \
                    netlink-plugin \
-                   dbus-plugin \
                    rtc-plugin \
                    urandom-plugin \
                    redirect \
                    rescue \
                    tty-plugin \
+                   ${@bb.utils.filter('DISTRO_FEATURES', 'pam', d)} \
                   "
 
 PACKAGECONFIG[random-seed] = "--with-random-seed=${RANDOM_SEED_FILE},--without-random-seed"
@@ -45,11 +45,14 @@ PACKAGECONFIG[auto-reload] = "--enable-auto-reload,--disable-auto-reload"
 PACKAGECONFIG[cgroup] = "--enable-cgroup,--disable-cgroup"
 PACKAGECONFIG[contrib] = "--enable-contrib,--disable-contrib"
 PACKAGECONFIG[doc] = "--enable-doc,--disable-doc"
+PACKAGECONFIG[dbus] = "--enable-dbus,--disable-dbus"
 PACKAGECONFIG[kernel-cmdline] = "--enable-kernel-cmdline,--disable-kernel-cmdline"
 PACKAGECONFIG[kernel-logging] = "--enable-kernel-logging,--disable-kernel-logging"
 PACKAGECONFIG[fastboot] = "--enable-fastboot,--disable-fastboot"
 PACKAGECONFIG[fsckfix] = "--enable-fsckfix,--disable-fsckfix"
+PACKAGECONFIG[pam] = "--enable-pam,--disable-pam,libpam"
 PACKAGECONFIG[redirect] = "--enable-redirect,--disable-redirect"
+PACKAGECONFIG[keventd] = "--with-keventd --with-udev-rules,--without-keventd --without-udev-rules,util-linux"
 PACKAGECONFIG[watchdog] = "--with-watchdog=${WATCHDOG_DEVICE},--without-watchdog"
 PACKAGECONFIG[reboot-watchdog] = ",,"
 PACKAGECONFIG[rescue] = "--enable-rescue,--disable-rescue"
@@ -78,21 +81,22 @@ TARGET_CFLAGS += "-DFINIT_NOLOGIN_PATH=\\"${NOLOGINS_FILE}\\""
 inherit autotools gettext pkgconfig update-alternatives
 
 SRC_URI = "git://github.com/troglobit/finit;protocol=https;branch=master;name=finit \
+           file://0001-Fix-420-run-services-inside-a-PAM-session.patch \
            file://10-hotplug.conf \
 "
 
-SRCREV_finit = "a81530754b1d43c5bf01e4777738e6807083f428"
+SRCREV_finit = "bad7c5c99a7694ac7051a59e636b2346651a3fad"
 
-PV = "4.16"
+PV = "5.0-rc1"
 
 S = "${WORKDIR}/git"
 
 PACKAGES =+ "${PN}-plugins ${PN}-bash-completion"
 
-DEPENDS += "libuev libite virtual/crypt"
+DEPENDS += "libuev libite libconfuse virtual/crypt"
 RDEPENDS:${PN} += "${PN}-plugins util-linux-fsck"
 
-FILES:${PN} += "${nonarch_libdir}/tmpfiles.d"
+FILES:${PN} += "${nonarch_libdir}/tmpfiles.d ${datadir}/dbus-1"
 FILES:${PN}-plugins = "${libdir}/finit/plugins"
 FILES:${PN}-bash-completion = "${datadir}/bash-completion"
 

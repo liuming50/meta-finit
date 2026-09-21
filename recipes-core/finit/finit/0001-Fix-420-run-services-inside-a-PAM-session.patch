@@ -1,0 +1,1385 @@
+From c53d169b4c680d8c63791598d43542c96f4ccb5a Mon Sep 17 00:00:00 2001
+From: Joachim Wiberg <troglobit@gmail.com>
+Date: Thu, 20 Aug 2026 17:29:25 +0200
+Subject: [PATCH] Fix #420: run services inside a PAM session
+
+Upstream-Status: Pending [Not submitted to upstream yet]
+
+Apply a PAM session to run/task/sysv/services Finit starts, pam_limits
+above all, so a service running as a given user picks up that user's
+limits the way a login does.
+
+Add a new `pam` setting for the new block format (only), like the
+per-service directories, naming a file in /etc/pam.d:
+
+    service weston {
+        user    = "weston"
+        pam     = "weston-autologin"
+        command = "/usr/bin/weston --continue-without-input"
+    }
+
+pam_close_session() has to be called by a process still holding the
+handle, and the handle does not survive exec().  Hence the keeper: it
+holds the handle, drops to the service's credentials, and waits for a
+parent-death signal before closing the session.  Same shape as
+systemd's (sd-pam), for the same reason, and one per fork, so the
+script hooks open and close their own.
+
+The keeper closes the descriptors it inherited from Finit and only
+those.  Closing everything would also take out what pam_open_session()
+opened for itself, a keyring fd or a lock file, and leave the modules
+to close a session with those pulled out from under them.  Closing
+nothing, as (sd-pam) does, would leave it holding the write end of the
+notify pipe for the service's whole lifetime and starve notify = "s6"
+services of their ready signal.  So the fds open before pam_start()
+are snapshotted and exactly those are closed, while the ones PAM opens
+after are marked close-on-exec so the daemon does not inherit them
+either.
+
+A refused value, a denied account stack, an uninstalled pam.d file,
+and a build without PAM support all keep the service from starting
+rather than running it with the stacks skipped: one that quietly loses
+pam_limits and its private /tmp, with nothing said.  Capabilities a
+module like pam_cap.so granted are merged into the IAB Finit applies
+instead of being replaced by it, which only helps a service that also
+sets capabilities, the other arm being a plain setuid() with nothing
+left to restore once permitted is empty.
+
+The test sysroot gains pam_permit.so, pam_deny.so and pam_limits.so,
+which ldd cannot see, libpam dlopen()s them, and the test skips when
+the host has none to stage.  The negative cases pin the exit status
+rather than only asserting crashed, which serv reports for any early
+exit, so a bad command or an unwritable pidfile cannot pass for a
+rejected session.
+
+Signed-off-by: Joachim Wiberg <troglobit@gmail.com>
+---
+ .github/workflows/build.yml |   2 +-
+ configure.ac                |  30 ++-
+ doc/build.md                |  14 ++
+ doc/config/capabilities.md  |   3 +
+ doc/config/migration.md     |   2 +-
+ doc/config/pam.md           | 151 ++++++++++++++
+ doc/config/runlevels.md     |   3 +
+ doc/config/service-env.md   |   3 +
+ doc/config/service-opts.md  |   1 +
+ doc/features.md             |  20 ++
+ mkdocs.yml                  |   1 +
+ src/Makefile.am             |   3 +
+ src/conf.c                  |  37 ++++
+ src/pam.c                   | 398 ++++++++++++++++++++++++++++++++++++
+ src/pam.h                   |  60 ++++++
+ src/service.c               | 101 ++++++++-
+ src/svc.h                   |   1 +
+ test/Makefile.am            |   2 +
+ test/lib/sysroot.mk         |  12 +-
+ test/pam-session.sh         | 122 +++++++++++
+ 20 files changed, 960 insertions(+), 6 deletions(-)
+ create mode 100644 doc/config/pam.md
+ create mode 100644 src/pam.c
+ create mode 100644 src/pam.h
+ create mode 100755 test/pam-session.sh
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index ca76a674..2db0a86a 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -99,7 +99,7 @@ jobs:
+       - name: Install dependencies
+         run: |
+           sudo apt-get -y update
+-          sudo apt-get -y install pkg-config tree jq libcap-dev libconfuse-dev libblkid-dev
++          sudo apt-get -y install pkg-config tree jq libcap-dev libconfuse-dev libblkid-dev libpam0g-dev
+           wget https://github.com/troglobit/libuev/releases/download/v2.4.1/libuev-2.4.1.tar.xz
+           wget https://github.com/troglobit/libite/releases/download/v2.6.2/libite-2.6.2.tar.gz
+           tar xf libuev-2.4.1.tar.xz
+diff --git a/configure.ac b/configure.ac
+index d0098860..1a575dc2 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -40,7 +40,7 @@ AC_PROG_MKDIR_P
+ 
+ # Configuration.
+ AC_CHECK_HEADERS([termios.h sys/ioctl.h mntent.h sys/sysmacros.h])
+-AC_CHECK_FUNCS([strstr getopt getmntent getmntent_r])
++AC_CHECK_FUNCS([strstr getopt getmntent getmntent_r close_range])
+ 
+ # Check for uint[8,16,32]_t
+ AC_TYPE_UINT8_T
+@@ -85,6 +85,11 @@ AC_ARG_ENABLE(libcap,
+         AS_HELP_STRING([--disable-libcap], [Disable Linux capabilities support]),,[
+ 				enable_libcap=yes])
+ 
++AC_ARG_ENABLE(pam,
++        AS_HELP_STRING([--disable-pam], [Disable PAM session support for services]),
++        [pam_explicit=yes],
++        [enable_pam=yes])
++
+ AC_ARG_ENABLE(redirect,
+         AS_HELP_STRING([--disable-redirect], [Disable redirection of service output to /dev/null]),,[
+ 	enable_redirect=yes])
+@@ -235,6 +240,26 @@ AS_IF([test "x$enable_libcap" = "xyes"], [
+ 	])
+ ])
+ 
++AS_IF([test "x$enable_pam" = "xyes"], [
++	AS_IF([test "x$enable_static" = "xyes"], [
++		AS_IF([test "x$pam_explicit" = "xyes"], [
++			AC_MSG_ERROR([--enable-pam does not work with --enable-static, PAM dlopen()s its modules])], [
++			AC_MSG_NOTICE([PAM disabled for static build, PAM dlopen()s its modules])
++			enable_pam=no])])
++])
++AS_IF([test "x$enable_pam" = "xyes"], [
++	AC_CHECK_HEADER([security/pam_appl.h], [], [
++		AC_MSG_WARN([PAM headers not found, PAM support disabled])
++		enable_pam=no])
++	AS_IF([test "x$enable_pam" = "xyes"], [
++		AC_CHECK_LIB([pam], [pam_start], [
++			AC_DEFINE(HAVE_LIBPAM, 1, [Have Linux-PAM for per-service session support])
++			LIBS="$LIBS -lpam"
++		], [
++			AC_MSG_WARN([libpam not found, PAM support disabled])
++			enable_pam=no])])
++])
++
+ AS_IF([test "x$enable_fastboot" = "xyes"], [
+ 	AC_DEFINE(FAST_BOOT, 1, [Skip fsck check on filesystems listed in /etc/fstab])])
+ 
+@@ -257,6 +282,8 @@ AS_IF([test "x$enable_dbus" = "xyes"], [
+ 	AC_DEFINE(HAVE_DBUS, 1, [Build D-Bus support via libink])])
+ AM_CONDITIONAL(DBUS, [test "x$enable_dbus" = "xyes"])
+ 
++AM_CONDITIONAL(PAM, [test "x$enable_pam" = "xyes"])
++
+ ### With features ##############################################################################
+ AS_IF([test "x$bash_dir" = "xyes"], [
+ 	PKG_CHECK_MODULES([BASH_COMPLETION], [bash-completion >= 2.0],
+@@ -461,6 +488,7 @@ Optional features:
+   Replacement libsystemd: $with_libsystemd
+   Use cgroup v2.........: $enable_cgroup
+   Use libcap............: $enable_libcap
++  Use PAM...............: $enable_pam
+   Parse kernel cmdline..: $enable_kernel_cmdline
+   Keep kernel logging...: $enable_kernel_logging
+   Skip fsck check.......: $enable_fastboot
+diff --git a/doc/build.md b/doc/build.md
+index 764890c6..3386cc00 100644
+--- a/doc/build.md
++++ b/doc/build.md
+@@ -15,6 +15,11 @@ and `/dev/disk/by-label/` symlinks after.  keventd is enabled by
+ default, so this is a hard requirement unless you build with
+ `--without-keventd`.
+ 
++PAM session support for services is built by default.  It needs
++[Linux-PAM][] (-lpam); the build falls back to no PAM support when that
++library is missing.  A static build, `--enable-static`, disables PAM
++too, since libpam loads its modules with `dlopen()`.
++
+ > [!IMPORTANT]
+ > Most free/open source software packages that use `configure` default
+ > to install to `/usr/local`.  However, some Linux distributions do no
+@@ -54,6 +59,14 @@ Below are a few of the main switches to configure:
+   built-ins (.o files) and all external libraries, except the C library
+   will be linked statically.
+ 
++* `--disable-pam`: Opt out of Finit's built-in PAM session support,
++  enabled by default, which lets a service declare `pam = "name"` and
++  run inside a session set up from `/etc/pam.d/name`.  Needs libpam,
++  falls back to disabled when it is missing, and is also disabled for
++  `--enable-static` builds.  Asking for `--enable-pam` and
++  `--enable-static` together is an error rather than a fallback.  See
++  [PAM Sessions](config/pam.md)
++
+ * `--enable-kernel-cmdline`: Enable Finit pre-4.1 parsing of init args from
+   `/proc/cmdline`, this is *not recommended* since Finit may be running as the
+   init for container apps that can see the host's `/proc` filesystem
+@@ -285,3 +298,4 @@ it only for debugging start up issues when Finit crashes.
+ [libite]:  https://github.com/troglobit/libite
+ [libConfuse]: https://github.com/libconfuse/libconfuse
+ [util-linux]: https://github.com/util-linux/util-linux
++[Linux-PAM]:  https://github.com/linux-pam/linux-pam
+diff --git a/doc/config/capabilities.md b/doc/config/capabilities.md
+index 9968b971..c675551a 100644
+--- a/doc/config/capabilities.md
++++ b/doc/config/capabilities.md
+@@ -189,6 +189,9 @@ ps -o user,pid,cmd -p $(pidof nginx)
+ - Services without `capabilities` use standard privilege dropping:
+   - Services with a non-root `user` have no special capabilities
+   - Services without `user` run as root with full capabilities
++- A capability granted by `pam_cap.so` in a [PAM session](pam.md) is
++  merged into this set, but only when `capabilities` is also set.
++  Without it the grant is lost when privileges drop
+ - Some very old binaries may not work correctly with ambient capabilities
+ - File system capabilities are not managed by Finit (use `setcap` for that)
+ 
+diff --git a/doc/config/migration.md b/doc/config/migration.md
+index 61b0562a..3ef9e214 100644
+--- a/doc/config/migration.md
++++ b/doc/config/migration.md
+@@ -261,7 +261,7 @@ Worth knowing
+     $SYSLOGD_ARGS"` working with an `envfile`.
+   * New settings only appear in the block format.  The first are the
+     [per-service directories](service-opts.md#service-directories),
+-    `runtime-dir` and friends.
++    `runtime-dir` and friends, and [`pam`](pam.md).
+ 
+ For the full description of every key, see the rest of the
+ [Configuration](index.md) section.
+diff --git a/doc/config/pam.md b/doc/config/pam.md
+new file mode 100644
+index 00000000..83501f12
+--- /dev/null
++++ b/doc/config/pam.md
+@@ -0,0 +1,151 @@
++PAM Sessions
++============
++
++`pam = "NAME"` runs a service inside a PAM session set up from
++`/etc/pam.d/NAME`.  The `session` stack in that file runs for the
++process that goes on to become the daemon, so modules like `pam_limits`,
++`pam_env`, or `pam_keyinit` see the service the way they see a login.
++
++## Basic Usage
++
++A display server that needs the session a login would have arranged for
++it:
++
++```conf
++service weston {
++    user    = "weston"
++    pam     = "weston-autologin"
++    command = "/usr/bin/weston --continue-without-input"
++}
++```
++
++With `/etc/pam.d/weston-autologin`:
++
++```
++auth     required  pam_permit.so
++account  required  pam_unix.so
++session  required  pam_unix.so
++session  required  pam_limits.so
++```
++
++The `auth` line is needed even though nothing is ever authenticated.
++Opening the session goes through `pam_setcred()`, which consults the
++`auth` stack, and an empty stack comes back as a permission denial, so a
++pam.d file with only `account` and `session` lines keeps the service
++from starting.
++
++The value names a file in `/etc/pam.d`, it is not a path.  A value
++holding `/` or `..`, or one too long to fit, is refused, with an error
++in the log when the .conf file is read.  The service does not start
++either, `initctl status` reports it as missing.  Like the per-service
++directory keys, `pam` exists in the block format only.
++
++## No Authentication
++
++Finit runs the account and session stacks, `pam_acct_mgmt()`,
++`pam_setcred()`, and `pam_open_session()`, and never
++`pam_authenticate()`.  A module that asks a question gets a
++conversation error back and its entry in the stack fails.
++
++A service whose account is denied, an expired account say, does not
++start, and neither does one naming a pam.d file that is not installed.
++The child exits 71 (`EX_OSERR`), `initctl status` shows the service as
++crashed, and PAM's own reason is in the log.
++
++## Requirements
++
++PAM support is built by default, see [Building Finit](../build.md).
++Without it, e.g. after `--disable-pam`, a service declaring `pam` is
++refused rather than started with the stacks skipped:
++
++    weston: pam weston-autologin requires Finit built with --enable-pam
++
++## Which Blocks Take It
++
++`service`, `task`, `run`, and `sysv`.  Not `tty`: `login` opens a
++session of its own there.
++
++Every fork gets its own session, so the `pre:`, `post:`, `ready:`, and
++`cleanup:` scripts each open and close one too, as do the stop and
++reload scripts and the `stop` call on a `sysv` script.
++
++A refused value stops those too.  A `pre:` script forks before the
++start-time check runs, so it exits 71 without running instead of the
++service being reported missing.
++
++## The User
++
++`user` decides who the session is for.  Without it the session is for
++root.
++
++systemd documents the opposite for its equivalent.  `systemd.exec(5)`
++says `PAMName=` is "only useful in conjunction with the `User=`
++setting, and is otherwise ignored".  That was true of systemd up to and
++including v256, v257 changed it to open a session for the manager's own
++user, and the man page was never updated.  Finit does what v257 does.
++
++A service with a [controlling tty](tty.md#controlling-tty-for-services)
++has it passed to PAM as `PAM_TTY`, for the modules that care which
++terminal a session is on.
++
++## Precedence
++
++Three places where PAM and a Finit setting cover the same ground:
++
++- `pam_limits` overrides a per-service `rlimit`.  A block asking for
++  `nofile = 4096` under a `limits.conf` that says 512 gets 512.
++- `pam_env` overrides Finit's own environment defaults, `PATH`, `USER`,
++  `LOGNAME`, and `HOME`, and `envfile` in turn overrides `pam_env`.  A
++  `HOME` from the session stack also moves the working directory, which
++  otherwise is the home directory from `/etc/passwd`.
++- The groups from `/etc/group` and `extra-groups` override `pam_group`.
++
++## The Session Keeper
++
++A helper is forked next to the service to close the session when the
++service exits, `(finit-pam)`:
++
++```
++     CGroup : /system/weston cpu 0 [100, max] mem [--.--, max]
++              |- 312 /usr/bin/weston --continue-without-input
++              `- 313 (finit-pam)
++```
++
++There is one per fork.  It runs as the service's user, in the service's
++cgroup, and stopping the service takes it along.
++
++A daemon that reaps children in its own `wait()` loop will see a child
++it never forked.  systemd has the same property, with `(sd-pam)`.
++
++## Limitations
++
++- `type = "forking"` closes the session early.  The initial process
++  exits by design, the keeper's parent-death signal fires with it, and
++  the session is closed while the real daemon runs on.  Finit warns
++  about the combination when it reads the .conf file, and starts the
++  service anyway:
++
++        /etc/finit.d/foo.conf: foo: pam with type = forking closes the
++        session when the initial process exits
++
++- A daemon whose initial thread exits while the process lives closes the
++  session the same way.  The parent-death signal follows the thread that
++  forked the keeper, not the process.
++- A capability granted by `pam_cap.so` is only kept when the service
++  also sets [`capabilities`](capabilities.md).
++- The keeper shares the service's cgroup, so an empty cgroup directory
++  can outlive a stop until the next start reuses it.  Cosmetic.
++- A module that blocks has no time bound.  `pam_open_session()` waits
++  for as long as the module does, `pam_ldap` against an unreachable
++  server, say, or `pam_mount` on a hung network mount.  The fork has already succeeded by then, so the service
++  reaches the running state and stays there with no daemon behind it.
++  Nothing crashes and nothing restarts.
++
++## See Also
++
++- [Service Options](service-opts.md) - the other run/task/service keys
++- [Linux Capabilities](capabilities.md) - the key `pam_cap.so` needs
++- [Building Finit](../build.md) - `--disable-pam` and its dependency
++- [pam(8)](https://man7.org/linux/man-pages/man8/pam.8.html) - the PAM library
++- [pam.d(5)](https://man7.org/linux/man-pages/man5/pam.d.5.html) - the file format
++- [pam_limits(8)](https://man7.org/linux/man-pages/man8/pam_limits.8.html) - limits from `limits.conf`
+diff --git a/doc/config/runlevels.md b/doc/config/runlevels.md
+index fef72efb..c157dfb3 100644
+--- a/doc/config/runlevels.md
++++ b/doc/config/runlevels.md
+@@ -160,6 +160,9 @@ albeit deprecated.
+ each `/etc/finit.d/*.conf` read.  I.e., a set of task/run/service
+ blocks can share the same rlimits if they are in the same .conf.
+ 
++For a service with [`pam`](pam.md), `pam_limits` runs after these
++limits are applied, so `limits.conf` has the last word.
++
+ Miscellaneous Settings
+ ----------------------
+ 
+diff --git a/doc/config/service-env.md b/doc/config/service-env.md
+index 6c7f0817..04e0b874 100644
+--- a/doc/config/service-env.md
++++ b/doc/config/service-env.md
+@@ -27,6 +27,9 @@ the `ps` command we can see that the process is started with:
+     foo -n --extra-arg=bar -s -x
+ 
+ > [!NOTE]
++For a service with [`pam`](pam.md), the session environment is applied
++before `envfile`, so the file overrides anything `pam_env` set.
++
+ > The leading `-` on `envfile` determines if Finit should treat a
+ > missing environment file as blocking the start of the service or not.
+ > When `-` is used, a missing environment file does *not* block the
+diff --git a/doc/config/service-opts.md b/doc/config/service-opts.md
+index 7b0fa509..b866012f 100644
+--- a/doc/config/service-opts.md
++++ b/doc/config/service-opts.md
+@@ -56,6 +56,7 @@ Other run/task/service settings are:
+   * `log {}` -- see [Redirecting Output](logging.md#redirecting-output)
+   * `tty` -- see [Controlling TTY](tty.md#controlling-tty-for-services)
+   * `notify` -- see [Service Synchronization](service-sync.md)
++  * `pam` -- see the [PAM Sessions](pam.md) section
+   * `if` -- see [Conditional Execution](services.md#conditional-execution)
+   * `type = "forking"` -- see description of the [service](services.md) block
+   * a leading `-` on `command` -- see
+diff --git a/doc/features.md b/doc/features.md
+index c1811010..c2024b36 100644
+--- a/doc/features.md
++++ b/doc/features.md
+@@ -178,6 +178,26 @@ See the [Linux Capabilities](config/capabilities.md) section for detailed
+ information, examples, and security best practices.
+ 
+ 
++**PAM Sessions**
++
++A service can run inside a PAM session, so the `session` stack in
++`/etc/pam.d` applies to it, e.g. limits from `pam_limits`:
++
++```conf
++service weston {
++    user    = "weston"
++    pam     = "weston-autologin"
++    command = "/usr/bin/weston --continue-without-input"
++}
++```
++
++Without a `user` the session is for root.  Requires a build with PAM
++support, which is the default; see `--disable-pam`.
++
++See the [PAM Sessions](config/pam.md) section for the pam.d file the
++example needs, and for how PAM and Finit settings interact.
++
++
+ **Supplementary Groups**
+ 
+ Finit supports supplementary groups for services, allowing them to access
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 367f7f05..4a96f5f9 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -39,6 +39,7 @@ nav:
+     - Logging: config/logging.md
+     - Cgroups: config/cgroups.md
+     - Capabilities: config/capabilities.md
++    - PAM Sessions: config/pam.md
+     - Templating: config/templating.md
+     - SysV Compatibility: config/sysv.md
+     - Rescue Mode: config/rescue.md
+diff --git a/src/Makefile.am b/src/Makefile.am
+index cd1fde63..30922242 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -76,6 +76,9 @@ endif
+ if DBUS
+ finit_SOURCES     += dbus.c
+ endif
++if PAM
++finit_SOURCES     += pam.c pam.h
++endif
+ 
+ pkginclude_HEADERS = cgroup.h cond.h conf.h finit.h helpers.h log.h \
+ 		     plugin.h svc.h service.h
+diff --git a/src/conf.c b/src/conf.c
+index 53f9f845..22e5e79d 100644
+--- a/src/conf.c
++++ b/src/conf.c
+@@ -276,6 +276,7 @@ static cfg_opt_t svc_opts[] = {
+ 
+ 	CFG_STR_LIST("capabilities", NULL, CFGF_NODEFAULT),
+ 	CFG_STR_LIST("caps",         NULL, CFGF_NODEFAULT),	/* alias */
++	CFG_STR     ("pam",          NULL, CFGF_NODEFAULT),
+ 	CFG_STR     ("runtime-dir",  NULL, CFGF_NODEFAULT),
+ 	CFG_STR     ("state-dir",    NULL, CFGF_NODEFAULT),
+ 	CFG_STR     ("cache-dir",    NULL, CFGF_NODEFAULT),
+@@ -1485,6 +1486,41 @@ static void dirs_translate(cfg_t *sec, svc_t *svc, char *file)
+ 	}
+ }
+ 
++/*
++ * Also block format only.  The value names a file in /etc/pam.d, so a
++ * path is refused rather than followed.
++ *
++ * A bad value is stored anyway, or as much of it as fits, and
++ * service_start() refuses to start the service.  Dropping it here
++ * instead would start the service with no session at all, which is the
++ * one outcome the service asking for a session cannot live with.
++ */
++static void pam_translate(cfg_t *sec, svc_t *svc, char *file)
++{
++	const char *str;
++
++	str = sec_getstr(sec, "pam", NULL);
++	if (!str || !str[0])
++		return;
++
++	if (strlcpy(svc->pam, str, sizeof(svc->pam)) >= sizeof(svc->pam)) {
++		logit(LOG_ERR, "%s: %s: pam '%s' is too long, not starting",
++		      file, cfg_title(sec), str);
++		return;
++	}
++
++	if (strchr(str, '/') || strstr(str, "..")) {
++		logit(LOG_ERR, "%s: %s: pam '%s' names a file in /etc/pam.d,"
++		      " not a path, not starting", file, cfg_title(sec), str);
++		return;
++	}
++
++	if (svc->forking)
++		logit(LOG_WARNING, "%s: %s: pam with type = forking closes the"
++		      " session when the initial process exits",
++		      file, cfg_title(sec));
++}
++
+ static void svc_translate(cfg_t *sec, int type, struct rlimit rlimit[], char *file)
+ {
+ 	struct rlimit local_rlimit[RLIMIT_NLIMITS];
+@@ -1699,6 +1735,7 @@ static void svc_translate(cfg_t *sec, int type, struct rlimit rlimit[], char *fi
+ 
+ 	dirs_translate(sec, svc, file);
+ 	provides_translate(sec, svc, file);
++	pam_translate(sec, svc, file);
+ }
+ 
+ /*
+diff --git a/src/pam.c b/src/pam.c
+new file mode 100644
+index 00000000..88348983
+--- /dev/null
++++ b/src/pam.c
+@@ -0,0 +1,398 @@
++/* Finit PAM session support
++ *
++ * Copyright (c) 2026  Joachim Wiberg <troglobit@gmail.com>
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#include "config.h"		/* Generated by configure script */
++
++#include <dirent.h>		/* opendir(), readdir(), dirfd() */
++#include <errno.h>
++#include <fcntl.h>		/* fcntl(), FD_CLOEXEC */
++#include <grp.h>		/* setgroups() */
++#include <security/pam_appl.h>
++#include <signal.h>
++#include <stdlib.h>		/* malloc(), free(), strtol() */
++#include <string.h>
++#include <sys/prctl.h>
++#include <unistd.h>
++
++#include "helpers.h"
++#include "log.h"
++#include "pam.h"
++#include "svc.h"
++
++/*
++ * A service has no terminal to prompt on and this path never
++ * authenticates, so a module that asks a question gets an error and its
++ * stack entry fails.  For a non-interactive service that is the answer
++ * we want.
++ */
++static int pam_dialog(int num_msg, const struct pam_message **msg,
++		      struct pam_response **resp, void *appdata)
++{
++	return PAM_CONV_ERR;
++}
++
++static const struct pam_conv conv = {
++	.conv        = pam_dialog,
++	.appdata_ptr = NULL,
++};
++
++/*
++ * The keeper never exec()s, so O_CLOEXEC does nothing for it, and it
++ * must not sit on Finit's event loop, api socket, inotify and
++ * notify-pipe descriptors for as long as the service lives.  But PAM
++ * and its modules may have opened descriptors of their own while
++ * pam_open_session() ran, e.g. a pam_systemd/pam_elogind bus
++ * connection, a keyring fd, or a lock file, and those have to survive
++ * until pam_close_session() runs in the keeper.  A blanket close of
++ * everything >= 3 cannot tell the two kinds apart, so take a snapshot
++ * of Finit's own fds before pam_start() opens anything of its own, and
++ * have the keeper close only those.
++ *
++ * Returns the number of fds found and sets *fdv to a malloc'd array of
++ * them, or -1 if /proc/self/fd could not be read, in which case the
++ * caller falls back to closing everything and PAM's own descriptors
++ * are lost along with Finit's.
++ */
++static int fdsnap(int **fdv)
++{
++	struct dirent *d;
++	int *v;
++	int n, i;
++	DIR *dir;
++	int dfd;
++
++	dir = opendir("/proc/self/fd");
++	if (!dir)
++		return -1;
++	dfd = dirfd(dir);
++
++	n = 0;
++	while ((d = readdir(dir))) {
++		char *end;
++		int fd;
++
++		fd = (int)strtol(d->d_name, &end, 10);
++		if (*end || fd < 3 || fd == dfd)
++			continue;
++
++		n++;
++	}
++
++	if (!n) {
++		closedir(dir);
++		*fdv = NULL;
++		return 0;
++	}
++
++	v = malloc(n * sizeof(*v));
++	if (!v) {
++		closedir(dir);
++		return -1;
++	}
++
++	rewinddir(dir);
++
++	i = 0;
++	while (i < n && (d = readdir(dir))) {
++		char *end;
++		int fd;
++
++		fd = (int)strtol(d->d_name, &end, 10);
++		if (*end || fd < 3 || fd == dfd)
++			continue;
++
++		v[i++] = fd;
++	}
++
++	closedir(dir);
++	*fdv = v;
++
++	return i;
++}
++
++/*
++ * Close exactly the fds fdsnap() found, leaving PAM's own alone.  With
++ * no snapshot (nfd < 0), fall back to closing everything >= 3, PAM's
++ * descriptors lost along with Finit's.
++ */
++static void closefds(int *fdv, int nfd)
++{
++	long max;
++	int i;
++
++	if (nfd >= 0) {
++		for (i = 0; i < nfd; i++)
++			close(fdv[i]);
++		return;
++	}
++
++	max = sysconf(_SC_OPEN_MAX);
++#ifdef HAVE_CLOSE_RANGE
++	if (!close_range(3, ~0U, 0))
++		return;
++#endif
++	if (max < 0)
++		max = 1024;
++	for (i = 3; i < max; i++)
++		close(i);
++}
++
++/*
++ * The descriptors PAM opened have to survive in the keeper, but not in
++ * the process that goes on to exec() the service: a bus connection, a
++ * keyring fd or a lock file the stack opened would otherwise be
++ * inherited by the daemon, and by the logit helper forked next to it,
++ * for as long as the service lives.  Finit's own fds are O_CLOEXEC,
++ * PAM's are not reliably, so diff a fresh snapshot against the one
++ * taken before pam_start() and mark everything new close-on-exec.  The
++ * keeper is unaffected, it was forked already and has its own
++ * descriptor table.
++ *
++ * With no snapshot to diff against (nfd < 0) there is nothing to do
++ * here, telling Finit's fds from PAM's is exactly what the snapshot is
++ * for.
++ */
++static void cloexec_pamfds(const char *id, int *fdv, int nfd)
++{
++	int *now = NULL;
++	int i, j, n;
++
++	if (nfd < 0)
++		return;
++
++	n = fdsnap(&now);
++	if (n < 0)
++		return;
++
++	for (i = 0; i < n; i++) {
++		int flags, old = 0;
++
++		for (j = 0; j < nfd; j++) {
++			if (now[i] == fdv[j]) {
++				old = 1;
++				break;
++			}
++		}
++		if (old)
++			continue;
++
++		flags = fcntl(now[i], F_GETFD);
++		if (flags == -1 || fcntl(now[i], F_SETFD, flags | FD_CLOEXEC))
++			logit(LOG_WARNING, "%s: pam: failed FD_CLOEXEC on fd %d,"
++			      " the service inherits it", id, now[i]);
++	}
++
++	free(now);
++}
++
++/*
++ * pam_getenvlist() hands back a NUL-terminated array of malloc'd
++ * "NAME=value" strings.  Free all of it so a failure past that point
++ * never leaves pamsess_open() returning a dangling *envp.
++ */
++static void free_envlist(char **envp)
++{
++	char **e;
++
++	if (!envp)
++		return;
++
++	for (e = envp; *e; e++)
++		free(*e);
++	free(envp);
++}
++
++/*
++ * Holds the PAM handle for the lifetime of the service and closes the
++ * session when it dies.  The handle was created before the fork, so
++ * pam_end() gets PAM_DATA_SILENT: this process is a copy, the modules
++ * must not run their full cleanup twice.
++ */
++static void keeper(pam_handle_t *h, uid_t uid, gid_t gid, pid_t ppid,
++		    sigset_t *mask, const char *id, int *fdv, int nfd)
++{
++	int rc, sig;
++
++	/* Finit's syslog socket is one of the fds about to be closed;
++	 * close it here first so syslog(3) knows to reconnect instead
++	 * of writing to a fd pulled out from under it. */
++	closelog();
++	closefds(fdv, nfd);
++	setprocnm("(finit-pam)");
++
++	/* No groups are needed to close a session */
++	if (setgroups(0, NULL))
++		warn("%s: pam: failed setgroups()", id);
++	if (setgid(gid))
++		warn("%s: pam: failed setgid(%d)", id, gid);
++	if (setuid(uid))
++		warn("%s: pam: failed setuid(%d)", id, uid);
++
++	/* After the credential change, which clears a pending pdeath signal */
++	if (prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0))
++		warn("%s: pam: failed PR_SET_PDEATHSIG", id);
++
++	/* The service may have exited already, then no signal is coming.
++	 * Anything but success means SIGTERM has not arrived yet, so keep
++	 * waiting: closing the session under a service that is still
++	 * running would leave nobody to close it later.  glibc reports
++	 * the error number as the return value and musl returns -1 with
++	 * errno set, hence the test on rc alone.  The mask is static, so
++	 * a failure that never clears is not reachable here. */
++	if (getppid() == ppid) {
++		do {
++			rc = sigwait(mask, &sig);
++		} while (rc);
++	}
++
++	rc = pam_setcred(h, PAM_DELETE_CRED | PAM_SILENT);
++	if (rc != PAM_SUCCESS)
++		logit(LOG_WARNING, "%s: pam: failed pam_setcred(DELETE_CRED): %s",
++		      id, pam_strerror(h, rc));
++
++	rc = pam_close_session(h, PAM_SILENT);
++	if (rc != PAM_SUCCESS)
++		logit(LOG_WARNING, "%s: pam: failed pam_close_session(): %s",
++		      id, pam_strerror(h, rc));
++
++	pam_end(h, rc | PAM_DATA_SILENT);
++	_exit(0);
++}
++
++/*
++ * Open a PAM session for svc, as root, before privileges are dropped.
++ * On success a keeper process has been forked and *envp holds the
++ * session environment for the caller to apply.  The process that goes
++ * on to exec() must not call pam_end(), its handle disappears with the
++ * exec; only the keeper ever closes the session.  *envp is only ever
++ * non-NULL on success.
++ */
++int pamsess_open(svc_t *svc, uid_t uid, gid_t gid, char ***envp)
++{
++	char *id = svc_ident(svc, NULL, 0);
++	pam_handle_t *h = NULL;
++	const char *user;
++	sigset_t mask, omask;
++	pid_t pid, ppid;
++	int *fdv = NULL;
++	int rc, nfd;
++	const char *why;
++
++	*envp = NULL;
++
++	/* Every fork funnels through here, service_start() only guards
++	 * the daemon itself, so this is where a value that must not
++	 * reach pam_start() is stopped. */
++	why = pam_invalid(svc->pam);
++	if (why) {
++		logit(LOG_ERR, "%s: pam '%s' %s", id, svc->pam, why);
++		return -1;
++	}
++
++	/* Snapshot Finit's own fds before pam_start() opens anything */
++	nfd = fdsnap(&fdv);
++
++	user = svc->username[0] ? svc->username : "root";
++
++	rc = pam_start(svc->pam, user, &conv, &h);
++	if (rc != PAM_SUCCESS) {
++		logit(LOG_ERR, "%s: failed pam_start(%s, %s): %s", id,
++		      svc->pam, user, pam_strerror(h, rc));
++		free(fdv);
++		return -1;
++	}
++
++	if (svc_has_ctty(svc)) {
++		rc = pam_set_item(h, PAM_TTY, svc->log.ctty);
++		if (rc != PAM_SUCCESS)
++			logit(LOG_WARNING, "%s: failed pam_set_item(PAM_TTY, %s): %s",
++			      id, svc->log.ctty, pam_strerror(h, rc));
++	}
++
++	rc = pam_acct_mgmt(h, PAM_SILENT);
++	if (rc != PAM_SUCCESS) {
++		logit(LOG_ERR, "%s: account denied by %s: %s", id, svc->pam,
++		      pam_strerror(h, rc));
++		goto fail;
++	}
++
++	rc = pam_setcred(h, PAM_ESTABLISH_CRED | PAM_SILENT);
++	if (rc != PAM_SUCCESS) {
++		logit(LOG_ERR, "%s: failed pam_setcred(%s): %s", id, svc->pam,
++		      pam_strerror(h, rc));
++		goto fail;
++	}
++
++	rc = pam_open_session(h, PAM_SILENT);
++	if (rc != PAM_SUCCESS) {
++		logit(LOG_ERR, "%s: failed pam_open_session(%s): %s", id,
++		      svc->pam, pam_strerror(h, rc));
++		goto cred;
++	}
++
++	*envp = pam_getenvlist(h);
++
++	/* Block SIGTERM before forking, the keeper must not miss it */
++	sigemptyset(&mask);
++	sigaddset(&mask, SIGTERM);
++	sigprocmask(SIG_BLOCK, &mask, &omask);
++
++	/* Forked here, before the service child calls setsid(), so the
++	 * keeper stays in Finit's process group.  Teardown does
++	 * kill(-svc->pid, SIGKILL) on the service's group, and a keeper
++	 * that had ended up there would be killed with the service,
++	 * before it ever gets to close the session. */
++	ppid = getpid();
++	pid = fork();
++	if (pid < 0) {
++		err(1, "%s: failed forking off PAM session keeper", id);
++		sigprocmask(SIG_SETMASK, &omask, NULL);
++		pam_close_session(h, PAM_SILENT);
++		free_envlist(*envp);
++		*envp = NULL;
++		goto cred;
++	}
++
++	if (!pid)
++		keeper(h, uid, gid, ppid, &mask, id, fdv, nfd);	/* does not return */
++
++	sigprocmask(SIG_SETMASK, &omask, NULL);
++	cloexec_pamfds(id, fdv, nfd);
++	free(fdv);
++	dbg("%s: PAM session %s open, keeper is PID %d", id, svc->pam, pid);
++
++	return 0;
++cred:
++	pam_setcred(h, PAM_DELETE_CRED | PAM_SILENT);
++fail:
++	free(fdv);
++	pam_end(h, rc);
++	return -1;
++}
++
++/**
++ * Local Variables:
++ *  indent-tabs-mode: t
++ *  c-file-style: "linux"
++ * End:
++ */
+diff --git a/src/pam.h b/src/pam.h
+new file mode 100644
+index 00000000..9d21ed13
+--- /dev/null
++++ b/src/pam.h
+@@ -0,0 +1,60 @@
++/* Finit PAM session support
++ *
++ * Copyright (c) 2026  Joachim Wiberg <troglobit@gmail.com>
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#ifndef FINIT_PAM_H_
++#define FINIT_PAM_H_
++
++#include <string.h>		/* strchr(), strlen(), strstr() */
++#include <sys/types.h>
++
++#include "svc.h"
++
++/*
++ * A pam value names a file in /etc/pam.d, it is not a path, and conf.c
++ * stores an over-long value truncated, so a value filling the buffer
++ * must not be passed on as some other, shorter name that happens to
++ * exist.  Both users share this one definition: service_start(), which
++ * refuses the service outright, log line and a visible state, and
++ * pamsess_open(), which every fork funnels through, including the pre:,
++ * post:, ready:, cleanup:, stop and reload scripts that run before
++ * service_start() ever does.
++ *
++ * Returns why the value cannot be used, or NULL when it can.
++ */
++static inline const char *pam_invalid(const char *pam)
++{
++	if (!pam[0])
++		return NULL;
++
++	if (strlen(pam) >= MAX_ARG_LEN - 1)
++		return "is too long";
++
++	if (strchr(pam, '/') || strstr(pam, ".."))
++		return "names a file in /etc/pam.d, not a path";
++
++	return NULL;
++}
++
++int pamsess_open(svc_t *svc, uid_t uid, gid_t gid, char ***envp);
++
++#endif /* FINIT_PAM_H_ */
+diff --git a/src/service.c b/src/service.c
+index e13d5199..36ddbfe0 100644
+--- a/src/service.c
++++ b/src/service.c
+@@ -54,6 +54,7 @@
+ #include "devmon.h"
+ #include "finit.h"
+ #include "helpers.h"
++#include "pam.h"
+ #include "pid.h"
+ #include "private.h"
+ #include "sig.h"
+@@ -544,10 +545,22 @@ static void set_uid(uid_t uid, svc_t *svc)
+ 	 */
+ 	if (svc->capabilities[0]) {
+ 		cap_iab_t cap_iab;
++#ifdef HAVE_LIBPAM
++		cap_iab_t pam_iab = NULL;
++		cap_value_t c;
++
++		/*
++		 * A module like pam_cap.so may have granted ambient
++		 * capabilities.  Capture them while we are still root,
++		 * cap_setuid() below clears them.
++		 */
++		if (svc->pam[0])
++			pam_iab = cap_iab_get_proc();
++#endif
+ 
+ 		if (cap_setuid(uid)) {
+ 			err(1, "%s: failed cap_setuid(%d)", svc_ident(svc, NULL, 0), uid);
+-			return;
++			goto out;
+ 		}
+ 
+ 		/* After dropping privileges, set the specific capabilities we need */
+@@ -555,15 +568,30 @@ static void set_uid(uid_t uid, svc_t *svc)
+ 		if (!cap_iab) {
+ 			err(1, "%s: failed parsing capabilities '%s'",
+ 			    svc_ident(svc, NULL, 0), svc->capabilities);
+-			return;
++			goto out;
+ 		}
+ 
++#ifdef HAVE_LIBPAM
++		/* Merge, do not overwrite, what PAM granted */
++		if (pam_iab) {
++			for (c = 0; c <= CAP_LAST_CAP; c++) {
++				if (cap_iab_get_vector(pam_iab, CAP_IAB_AMB, c))
++					cap_iab_set_vector(cap_iab, CAP_IAB_AMB, c, CAP_SET);
++			}
++		}
++#endif
++
+ 		if (cap_iab_set_proc(cap_iab) != 0) {
+ 			cap_free(cap_iab);
+ 			err(1, "%s: failed setting capabilities",
+ 			    svc_ident(svc, NULL, 0));
+ 		}
+ 		cap_free(cap_iab);
++out:
++#ifdef HAVE_LIBPAM
++		cap_free(pam_iab);
++#endif
++		return;
+ 	} else
+ #endif
+ 	if (setuid(uid))
+@@ -703,6 +731,9 @@ static pid_t service_fork(svc_t *svc)
+ 
+ 	if (pid == 0) {
+ 		char *home = NULL;
++#ifdef HAVE_LIBPAM
++		char **pam_env = NULL;
++#endif
+ #ifdef ENABLE_STATIC
+ 		int uid = 0; /* XXX: Fix better warning that dropprivs is disabled. */
+ 		int gid = 0;
+@@ -735,6 +766,15 @@ static pid_t service_fork(svc_t *svc)
+ 				      svc_ident(svc, NULL, 0), rlim2str(i));
+ 		}
+ 
++#ifdef HAVE_LIBPAM
++		/*
++		 * After our own rlimits so pam_limits wins, and before
++		 * any credential change: the session stack needs root.
++		 */
++		if (svc->pam[0] && pamsess_open(svc, uid, gid, &pam_env))
++			_exit(EX_OSERR);
++#endif
++
+ #ifndef ENABLE_STATIC
+ 		/* Set supplementary groups from /etc/group and config */
+ 		{
+@@ -797,6 +837,28 @@ static pid_t service_fork(svc_t *svc)
+ 			}
+ 		}
+ 
++#ifdef HAVE_LIBPAM
++		/* pam_env after our defaults, before env:file */
++		if (pam_env) {
++			const char *pam_home;
++
++			for (int i = 0; pam_env[i]; i++)
++				putenv(pam_env[i]);
++
++			/* pam_env has the last word on HOME, so the
++			 * working directory has to follow it, the chdir()
++			 * above used the passwd home. */
++			pam_home = getenv("HOME");
++			if (pam_home && (!home || strcmp(pam_home, home))) {
++				if (chdir(pam_home)) {
++					if (chdir("/"))
++						err(1, "%s: failed chdir(%s) and chdir(/)",
++						    svc_ident(svc, NULL, 0), pam_home);
++				}
++			}
++		}
++#endif
++
+ 		/* Source any environment from env:/path/to/file */
+ 		source_env(svc);
+ 	}
+@@ -811,6 +873,26 @@ static pid_t service_fork(svc_t *svc)
+ 	return pid;
+ }
+ 
++/*
++ * Checked here, next to the other preconditions, and not only in
++ * conf.c, because a .conf reload rewrites the service and would
++ * otherwise let a refused value start it after all.  Running without
++ * the session the service asked for costs it pam_limits, its private
++ * /tmp, and its logind session, with nothing said.
++ */
++static int pam_refused(svc_t *svc)
++{
++	const char *why = pam_invalid(svc->pam);
++
++	if (!why)
++		return 0;
++
++	logit(LOG_ERR, "%s: pam '%s' %s, not starting",
++	      svc_ident(svc, NULL, 0), svc->pam, why);
++
++	return 1;
++}
++
+ /**
+  * service_start - Start service
+  * @svc: Service to start
+@@ -854,6 +936,20 @@ static int service_start(svc_t *svc)
+ 		return 1;
+ 	}
+ 
++	if (pam_refused(svc)) {
++		svc_missing(svc);
++		return 1;
++	}
++
++#ifndef HAVE_LIBPAM
++	if (svc->pam[0]) {
++		logit(LOG_ERR, "%s: pam %s requires Finit built with --enable-pam",
++		      svc_ident(svc, NULL, 0), svc->pam);
++		svc_missing(svc);
++		return 1;
++	}
++#endif
++
+ 	if (svc_is_tty(svc) && !svc->notty) {
+ 		char *dev = tty_canonicalize(svc->dev);
+ 
+@@ -2505,6 +2601,7 @@ svc_t *service_register(int type, char *cfg, struct rlimit rlimit[], char *file)
+ 		memset(svc->capabilities, 0, sizeof(svc->capabilities));
+ 
+ 	/* block format only, set by conf.c after registration */
++	memset(svc->pam, 0, sizeof(svc->pam));
+ 	for (int i = 0; i < NUM_SVCDIRS; i++) {
+ 		memset((char *)svc + svcdirs[i].off, 0, MAX_ARG_LEN);
+ 		svc->dir_mode[i] = 0755;
+diff --git a/src/svc.h b/src/svc.h
+index e43be536..6a25f387 100644
+--- a/src/svc.h
++++ b/src/svc.h
+@@ -203,6 +203,7 @@ typedef struct svc {
+ 	char	       supgroups[MAX_NUM_SUPGROUPS][MAX_USER_LEN];
+ 	int		       num_supgroups;
+ 	char	       capabilities[MAX_CMD_LEN];
++	char	       pam[MAX_ARG_LEN];	/* /etc/pam.d/NAME, block format only */
+ 
+ 	/* Directories set up for the service, block format only, the
+ 	 * name is resolved under a fixed base, e.g. /run/NAME */
+diff --git a/test/Makefile.am b/test/Makefile.am
+index 1bd5cd6d..b45e62a9 100644
+--- a/test/Makefile.am
++++ b/test/Makefile.am
+@@ -51,6 +51,7 @@ EXTRA_DIST		+= global-envs.sh
+ EXTRA_DIST		+= initctl-status-subset.sh
+ EXTRA_DIST		+= keventd.sh
+ EXTRA_DIST		+= notify.sh
++EXTRA_DIST		+= pam-session.sh
+ EXTRA_DIST		+= pidfile.sh
+ EXTRA_DIST		+= stale-pidfile.sh
+ EXTRA_DIST		+= pre-post-serv.sh
+@@ -118,6 +119,7 @@ if KEVENTD
+ TESTS			+= keventd.sh
+ endif
+ TESTS			+= notify.sh
++TESTS			+= pam-session.sh
+ TESTS			+= pidfile.sh
+ TESTS			+= stale-pidfile.sh
+ TESTS			+= pre-post-serv.sh
+diff --git a/test/lib/sysroot.mk b/test/lib/sysroot.mk
+index 42c972c3..145e3a67 100644
+--- a/test/lib/sysroot.mk
++++ b/test/lib/sysroot.mk
+@@ -39,6 +39,15 @@ BBURL          ?= $(BBHOME)/$(BBVER)/$(BBBIN)
+ _libs_nss      := $(firstword $(wildcard /lib/$(ARCH)-linux-gnu/libnss_files.so.2 \
+                                          /usr/lib/$(ARCH)-linux-gnu/libnss_files.so.2 \
+                                          /lib64/libnss_files.so.2 /lib/libnss_files.so.2))
++# PAM dlopen()s its modules too, so ldd cannot see them either.  Only
++# the three the pam-session test needs; absent is fine, it skips.  Their
++# own dependencies are picked up by the ldd pass below.  libpam looks in
++# one compiled-in directory, and here /lib and /usr/lib are two real
++# directories rather than the host's symlink, so /usr/lib comes first.
++_pam_mods      := $(foreach m,pam_permit.so pam_deny.so pam_limits.so,				\
++                    $(firstword $(wildcard /usr/lib/$(ARCH)-linux-gnu/security/$(m)	\
++                                           /lib/$(ARCH)-linux-gnu/security/$(m)	\
++                                           /lib/security/$(m))))
+ # A real broker and a real client, staged when the host has them, so
+ # one test can check Finit against dbus-daemon instead of only against
+ # libink's own client.  Absent is fine, dbus-broker.sh skips.
+@@ -53,7 +62,8 @@ _bins          := $(FINITBIN) $(dbus_bins) \
+ # The dbus binaries stage exactly like the libraries: same host path,
+ # same path under DEST, copied by the rule below.
+ _libs_src      := $(foreach bin,$(_bins),$(shell ldd $(bin) 2>/dev/null | grep -Eo '/[^ ]+')) \
+-                  $(_libs_nss) $(dbus_bins)
++                  $(foreach mod,$(_pam_mods),$(shell ldd $(mod) 2>/dev/null | grep -Eo '/[^ ]+')) \
++                  $(_libs_nss) $(_pam_mods) $(dbus_bins)
+ libs           := $(foreach path,$(sort $(_libs_src)),$(abspath $(DEST))$(path))
+ 
+ all: $(libs) $(DEST)/bin/$(BBBIN)
+diff --git a/test/pam-session.sh b/test/pam-session.sh
+new file mode 100755
+index 00000000..9a8e3914
+--- /dev/null
++++ b/test/pam-session.sh
+@@ -0,0 +1,122 @@
++#!/bin/sh
++# A service can run inside a PAM session, so the session stack in
++# /etc/pam.d applies to the process that becomes the daemon.
++#
++# The session outlives the setup: a keeper process, (finit-pam), holds
++# the PAM handle and closes the session when the service dies.  Here we
++# check that it appears and disappears with the service, that a denied
++# account stack keeps the service from running at all, and that a
++# missing pam.d config, or a value that is a path rather than a name,
++# does the same.
++#
++# Skipped unless Finit was built --enable-pam and the host had PAM
++# modules for lib/sysroot.mk to stage.
++set -eu
++
++TEST_DIR=$(dirname "$0")
++
++test_teardown()
++{
++    say "Running test teardown."
++    run "rm -f $FINIT_CONF"
++    run "rm -f /tmp/pre"
++    run "rm -rf /etc/pam.d"
++    run "rm -rf /etc/security"
++}
++
++# shellcheck source=/dev/null
++. "$TEST_DIR/lib/setup.sh"
++
++# shellcheck disable=SC2154 # top_builddir comes from AM_TESTS_ENVIRONMENT
++grep -q "define HAVE_LIBPAM" "$top_builddir/config.h" 2>/dev/null \
++    || skip "Finit built without --enable-pam"
++
++# Staged by lib/sysroot.mk from the host, when it has them.  All three,
++# not just pam_permit.so: without pam_deny.so the denied case would fail
++# for the wrong reason and still look like a pass.
++# shellcheck disable=SC2016 # the globs are for the shell inside texec
++PAMDIR=$(texec sh -c 'for d in /lib/*/security /usr/lib/*/security /lib/security; do
++                          test -f "$d/pam_permit.so" || continue
++                          test -f "$d/pam_deny.so"   || continue
++                          test -f "$d/pam_limits.so" || continue
++                          echo "$d" && break
++                      done')
++[ -n "$PAMDIR" ] || skip "no PAM modules in the test root, need them on the host"
++
++assert_keeper()
++{
++    assert "$1 PAM session keeper(s)" \
++           "$(texec sh -c 'cat /proc/[0-9]*/comm 2>/dev/null | grep -c "(finit-pam)"' || true)" -eq "$1"
++}
++
++# pamsess_open() leaves the child with EX_OSERR, so a service that fails
++# for any other reason -- a bad command, a pidfile it cannot write -- is
++# a test failure rather than a pass.
++denied="crashed (code=exited, status=71/OSERR)"
++
++say 'A permissive PAM config, and one that denies the account stack'
++run "mkdir -p /etc/pam.d"
++run "printf 'auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_permit.so\n' > /etc/pam.d/finit-ok"
++run "printf 'auth required pam_permit.so\naccount required pam_deny.so\nsession required pam_permit.so\n'   > /etc/pam.d/finit-no"
++
++say 'A service in a session runs, and a keeper appears alongside it'
++run "printf 'service pamok {\n runlevel = \"S12345\"\n user = \"daemon\"\n pam = \"finit-ok\"\n command = \"/sbin/serv -n -i pamok\"\n}\n' > $FINIT_CONF"
++run "initctl reload"
++retry 'assert_status pamok running'
++retry 'assert_keeper 1'
++
++say 'Stopping the service takes the keeper with it'
++run "initctl stop pamok"
++retry 'assert_status pamok stopped'
++retry 'assert_keeper 0'
++
++say 'Starting again opens a fresh session'
++run "initctl start pamok"
++retry 'assert_status pamok running'
++retry 'assert_keeper 1'
++run "initctl stop pamok"
++retry 'assert_keeper 0'
++
++say 'A denied account stack keeps the service from running'
++run "printf 'service pamno {\n runlevel = \"S12345\"\n user = \"daemon\"\n pam = \"finit-no\"\n command = \"/sbin/serv -n -i pamno\"\n}\n' > $FINIT_CONF"
++run "initctl reload"
++retry "assert_status_full pamno '$denied'" 500
++assert_keeper 0
++
++say 'So does a pam.d config that is not there'
++run "printf 'service pamgone {\n runlevel = \"S12345\"\n user = \"daemon\"\n pam = \"finit-no-such-config\"\n command = \"/sbin/serv -n -i pamgone\"\n}\n' > $FINIT_CONF"
++run "initctl reload"
++retry "assert_status_full pamgone '$denied'" 500
++assert_keeper 0
++
++say 'A pam value that is a path is refused, the service does not start'
++run "printf 'service pampath {\n runlevel = \"S12345\"\n user = \"daemon\"\n pam = \"/etc/pam.d/finit-ok\"\n command = \"/sbin/serv -n -i pampath\"\n}\n' > $FINIT_CONF"
++run "initctl reload"
++retry 'assert_status pampath missing'
++assert_keeper 0
++
++# The pre: script forks from SVC_SETUP_STATE, before service_start()
++# runs, so it is pamsess_open() that has to refuse the value here.  The
++# script exits 71 without ever running, hence no /tmp/pre.
++say 'And a pre: script does not get the refused value either'
++run "printf 'service pampre {\n runlevel = \"S12345\"\n user = \"daemon\"\n pam = \"/etc/pam.d/finit-ok\"\n exec-start-pre = \"/bin/pre.sh\"\n command = \"/sbin/serv -n -i pampre\"\n}\n' > $FINIT_CONF"
++run "initctl reload"
++retry "assert_status_full pampre '$denied'" 500
++assert "pre: script did not run" "$(texec sh -c 'test -e /tmp/pre && echo yes || echo no')" = "no"
++assert_keeper 0
++
++say 'pam_limits wins over the per-service rlimit'
++run "mkdir -p /etc/security"
++run "printf 'daemon hard nofile 512\ndaemon soft nofile 512\n' > /etc/security/limits.conf"
++run "printf 'auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_limits.so\n' > /etc/pam.d/finit-lim"
++run "printf 'service pamlim {\n runlevel = \"S12345\"\n user = \"daemon\"\n pam = \"finit-lim\"\n rlimit {\n  nofile = 4096\n }\n command = \"/sbin/serv -n -i pamlim\"\n}\n' > $FINIT_CONF"
++run "initctl reload"
++retry 'assert_status pamlim running'
++
++pamlim_pid=$(texec initctl -j status pamlim | jq -M .pid)
++# shellcheck disable=SC2016 # $4 is awk's field reference, not the shell's
++assert "nofile is 512, from limits.conf, not 4096 from the block" \
++       "$(texec awk '/Max open files/ { print $4 }' "/proc/$pamlim_pid/limits")" = "512"
++
++run "initctl stop pamlim"
++retry 'assert_keeper 0'
+-- 
+2.43.0
+

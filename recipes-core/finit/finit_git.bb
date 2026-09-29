@@ -17,6 +17,8 @@ def get_custom_rtc_restore_date(d):
     else:
         return datetime.datetime.now().strftime('%4Y-%2m-%2d %2H:%2M:%2S')
 
+# kevent or hotplug-plugin
+UEVENT_MANAGER ?= "hotplug-plugin"
 RTC_RESTORE_DATE ?= "${@get_custom_rtc_restore_date(d)}"
 RANDOM_SEED_FILE ?= "/var/lib/misc/random-seed"
 WATCHDOG_DEVICE ?= "/dev/watchdog"
@@ -24,11 +26,11 @@ WATCHDOG_DEVICE ?= "/dev/watchdog"
 PACKAGECONFIG_CONFARGS[vardepsexclude] = "RTC_RESTORE_DATE"
 PACKAGECONFIG ??= "auto-reload \
                    dbus \
+                   dbus-plugin \
                    fastboot \
                    random-seed \
                    hook-scripts-plugin \
                    kernel-cmdline \
-                   keventd \
                    libcap \
                    modules-load-plugin \
                    netlink-plugin \
@@ -37,6 +39,7 @@ PACKAGECONFIG ??= "auto-reload \
                    redirect \
                    rescue \
                    tty-plugin \
+                   ${UEVENT_MANAGER} \
                    ${@bb.utils.filter('DISTRO_FEATURES', 'pam', d)} \
                   "
 
@@ -81,11 +84,12 @@ TARGET_CFLAGS += "-DFINIT_NOLOGIN_PATH=\\"${NOLOGINS_FILE}\\""
 inherit autotools gettext pkgconfig update-alternatives
 
 SRC_URI = "git://github.com/troglobit/finit;protocol=https;branch=master;name=finit \
-           file://0001-Fix-420-run-services-inside-a-PAM-session.patch \
+           file://machine-id-setup.sh \
+           file://01-machine-id.conf \
            file://10-hotplug.conf \
 "
 
-SRCREV_finit = "bad7c5c99a7694ac7051a59e636b2346651a3fad"
+SRCREV_finit = "417abf90007512e61d9b26e6d9150183c17aad62"
 
 PV = "5.0-rc1"
 
@@ -94,7 +98,7 @@ S = "${WORKDIR}/git"
 PACKAGES =+ "${PN}-plugins ${PN}-bash-completion"
 
 DEPENDS += "libuev libite libconfuse virtual/crypt"
-RDEPENDS:${PN} += "${PN}-plugins util-linux-fsck"
+RDEPENDS:${PN} += "${PN}-plugins util-linux-fsck ${@bb.utils.contains('PACKAGECONFIG','dbus-plugin','','util-linux-uuidgen',d)}"
 
 FILES:${PN} += "${nonarch_libdir}/tmpfiles.d ${datadir}/dbus-1"
 FILES:${PN}-plugins = "${libdir}/finit/plugins"
@@ -124,7 +128,13 @@ do_install:append() {
     ln -sf ${libexecdir}/finit/getty ${D}${base_sbindir}/getty
     ln -sf ${libexecdir}/finit/logit ${D}${base_sbindir}/logit
     ln -sf ${libexecdir}/finit/runparts ${D}${base_sbindir}/runparts
-    ln -sf  ${localstatedir}/lib/dbus/machine-id ${D}${sysconfdir}/machine-id
+
+    if ${@bb.utils.contains('PACKAGECONFIG','dbus-plugin','true','false',d)}; then
+        ln -sf  ${localstatedir}/lib/dbus/machine-id ${D}${sysconfdir}/machine-id
+    else
+        install -m 0755 ${WORKDIR}/machine-id-setup.sh ${D}${base_sbindir}/machine-id-setup
+        install -m 0644 ${WORKDIR}/01-machine-id.conf ${D}${libdir}/finit/system
+    fi
 
     if ${@bb.utils.contains('PACKAGECONFIG','hotplug-plugin','true','false',d)}; then
         # Install a customized 10-hotplug.conf

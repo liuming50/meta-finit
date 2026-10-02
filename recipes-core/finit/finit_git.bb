@@ -89,7 +89,7 @@ SRC_URI = "git://github.com/troglobit/finit;protocol=https;branch=master;name=fi
            file://10-hotplug.conf \
 "
 
-SRCREV_finit = "417abf90007512e61d9b26e6d9150183c17aad62"
+SRCREV_finit = "cec76f18a3d346d418bf9bc0b65ed512663a7159"
 
 PV = "5.0-rc1"
 
